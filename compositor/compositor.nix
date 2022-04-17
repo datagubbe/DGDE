@@ -1,4 +1,5 @@
 { clang-tools
+, lib
 , libxkbcommon
 , meson
 , ninja
@@ -11,7 +12,7 @@
 , wlroots
 }:
 stdenv.mkDerivation {
-  name = "dgde";
+  name = "dgde-compositor";
   src = ./.;
 
   nativeBuildInputs = [

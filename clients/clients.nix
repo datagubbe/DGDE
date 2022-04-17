@@ -1,17 +1,15 @@
 { clang-tools
-, libxkbcommon
 , meson
+, libGL
 , ninja
-, pixman
 , pkg-config
 , stdenv
-, systemdMinimal
 , wayland
 , wayland-protocols
-, wlroots
 }:
+
 stdenv.mkDerivation {
-  name = "dgde";
+  name = "dgde-clients";
   src = ./.;
 
   nativeBuildInputs = [
@@ -22,11 +20,8 @@ stdenv.mkDerivation {
   ];
 
   buildInputs = [
-    pixman
-    systemdMinimal
-    wlroots
     wayland
     wayland-protocols
-    libxkbcommon
+    libGL
   ];
 }

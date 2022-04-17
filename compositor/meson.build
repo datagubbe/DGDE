@@ -1,4 +1,10 @@
-project('dgde', 'c')
+project(
+  'dgde',
+  'c',
+  default_options: [
+    'c_std=c11',
+  ]
+)
 
 wlroots = dependency('wlroots')
 wayland = dependency('wayland-server')
@@ -16,8 +22,14 @@ xdg_shell_header = custom_target(
 )
 
 executable(
-  'tinywl',
-  ['src/main.c', xdg_shell_header],
+  'dgde',
+  [
+    'src/main.c',
+    'src/cursor.c',
+    'src/view.c',
+    'src/server.c',
+    xdg_shell_header
+  ],
   dependencies: [wlroots, wayland, libudev, pixman, xkbcommon],
   c_args: '-DWLR_USE_UNSTABLE',
   install: true
