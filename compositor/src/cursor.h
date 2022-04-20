@@ -38,7 +38,8 @@ struct dgde_cursor_handler {
   dgde_cursor_frame_cb frame;
 };
 
-struct dgde_cursor *dgde_cursor_create(struct wlr_output_layout *output_layout);
+struct dgde_cursor *dgde_cursor_create(struct wlr_output_layout *output_layout,
+                                       struct wlr_seat *seat);
 
 void dgde_cursor_new_pointer(struct dgde_cursor *cursor,
                              struct wlr_input_device *device);
@@ -46,10 +47,16 @@ void dgde_cursor_set_surface(
     struct dgde_cursor *cursor,
     struct wlr_seat_pointer_request_set_cursor_event *event);
 
-struct dgde_cursor_position dgde_cursor_position(struct dgde_cursor *cursor);
+struct dgde_cursor_position
+dgde_cursor_position(const struct dgde_cursor *cursor);
+
+enum dgde_cursor_mode dgde_cursor_mode(const struct dgde_cursor *cursor);
+enum dgde_cursor_mode dgde_cursor_set_mode(struct dgde_cursor *cursor,
+                                           enum dgde_cursor_mode mode);
+enum dgde_cursor_mode dgde_cursor_reset_mode(struct dgde_cursor *cursor);
 
 void dgde_cursor_add_handler(struct dgde_cursor *cursor,
-                             struct dgde_cursor_handler *handler);
+                             const struct dgde_cursor_handler *handler);
 
 void dgde_cursor_set_image(struct dgde_cursor *cursor, const char *image);
 void dgde_cursor_destroy(struct dgde_cursor *cursor);

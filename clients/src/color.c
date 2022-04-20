@@ -33,28 +33,6 @@ struct window {
   } egl_context;
 };
 
-static void global_registry_handler(void *data, struct wl_registry *registry,
-                                    uint32_t id, const char *interface,
-                                    uint32_t version) {
-  printf("Got a registry event for %s id %d\n", interface, id);
-  struct window *window = data;
-  if (strcmp(interface, wl_compositor_interface.name) == 0) {
-    window->compositor =
-        wl_registry_bind(registry, id, &wl_compositor_interface, 1);
-  } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
-    window->xdg_base =
-        wl_registry_bind(registry, id, &xdg_wm_base_interface, 1);
-  }
-}
-
-static void global_registry_remover(void *data, struct wl_registry *registry,
-                                    uint32_t id) {
-  printf("Got a registry losing event for %d\n", id);
-}
-
-static const struct wl_registry_listener registry_listener = {
-    global_registry_handler, global_registry_remover};
-
 static void draw(struct window *window, uint32_t color) {
 
   EGLSurface egl_surface = window->egl_context.surface;
@@ -78,10 +56,8 @@ static void create_window(struct window *window) {
 
   window->egl_context.window = wl_egl_window_create(window->surface, 480, 360);
   if (window->egl_context.window == EGL_NO_SURFACE) {
-    fprintf(stderr, "Can't create egl window\n");
+    fprintf(stderr, "Failed to create EGL window\n");
     return;
-  } else {
-    fprintf(stderr, "Created egl window\n");
   }
 
   window->egl_context.surface = eglCreateWindowSurface(
@@ -148,6 +124,28 @@ static void init_egl(struct wl_display *display, struct window *window) {
                        EGL_NO_CONTEXT, context_attribs);
 }
 
+static void global_registry_handler(void *data, struct wl_registry *registry,
+                                    uint32_t id, const char *interface,
+                                    uint32_t version) {
+  printf("Got a registry event for %s id %d\n", interface, id);
+  struct window *window = data;
+  if (strcmp(interface, wl_compositor_interface.name) == 0) {
+    window->compositor =
+        wl_registry_bind(registry, id, &wl_compositor_interface, 1);
+  } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+    window->xdg_base =
+        wl_registry_bind(registry, id, &xdg_wm_base_interface, 1);
+  }
+}
+
+static void global_registry_remover(void *data, struct wl_registry *registry,
+                                    uint32_t id) {
+  printf("Got a registry losing event for %d\n", id);
+}
+
+static const struct wl_registry_listener registry_listener = {
+    global_registry_handler, global_registry_remover};
+
 static void get_server_references(struct wl_display *display,
                                   struct window *window) {
 
@@ -164,12 +162,14 @@ static void get_server_references(struct wl_display *display,
   }
 }
 
-void handle_ping(void *data, struct xdg_wm_base *xdg_base, uint32_t serial) {
+static void handle_ping(void *data, struct xdg_wm_base *xdg_base,
+                        uint32_t serial) {
   xdg_wm_base_pong(xdg_base, serial);
 }
 
-void handle_configure(void *data, struct xdg_toplevel *toplevel, int32_t width,
-                      int32_t height, struct wl_array *states) {
+static void handle_configure(void *data, struct xdg_toplevel *toplevel,
+                             int32_t width, int32_t height,
+                             struct wl_array *states) {
   if ((width == height) == 0) {
     return;
   }
@@ -178,12 +178,12 @@ void handle_configure(void *data, struct xdg_toplevel *toplevel, int32_t width,
   wl_egl_window_resize(window->egl_context.window, width, height, 0, 0);
 }
 
-void handle_surface_configure(void *data, struct xdg_surface *surface,
-                              uint32_t serial) {
+static void handle_surface_configure(void *data, struct xdg_surface *surface,
+                                     uint32_t serial) {
   xdg_surface_ack_configure(surface, serial);
 }
 
-uint32_t color_from_str(const char *color) {
+static uint32_t color_from_str(const char *color) {
   if (strncmp(color, "green", 5) == 0) {
     return 0x00ff00;
   } else if (strncmp(color, "blue", 4) == 0) {

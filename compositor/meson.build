@@ -1,8 +1,9 @@
 project(
-  'dgde',
+  'dgde-compositor',
   'c',
   default_options: [
     'c_std=c11',
+    'werror=true',
   ]
 )
 
@@ -28,7 +29,8 @@ executable(
     'src/cursor.c',
     'src/view.c',
     'src/server.c',
-    xdg_shell_header
+    'src/keyboard.c',
+    xdg_shell_header,
   ],
   dependencies: [wlroots, wayland, libudev, pixman, xkbcommon],
   c_args: '-DWLR_USE_UNSTABLE',
