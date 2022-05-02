@@ -15,6 +15,31 @@
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/edges.h>
 
+struct dgde_server {
+  struct wl_display *wl_display;
+  struct wlr_backend *backend;
+  struct wlr_renderer *renderer;
+
+  struct wlr_xdg_shell *xdg_shell;
+  struct wl_listener new_xdg_surface;
+  struct wl_list views;
+
+  struct dgde_cursor *cursor;
+
+  struct wlr_seat *seat;
+  struct wl_listener new_input;
+  struct wl_listener request_set_selection;
+  struct wl_list keyboards;
+  struct dgde_view *grabbed_view;
+  double grab_x, grab_y;
+  struct wlr_box grab_geobox;
+  uint32_t resize_edges;
+
+  struct wlr_output_layout *output_layout;
+  struct wl_list outputs;
+  struct wl_listener new_output;
+};
+
 struct dgde_output {
   struct wl_list link;
   struct dgde_server *server;
@@ -26,45 +51,6 @@ struct view_elem {
   struct dgde_view *view;
   struct wl_list link;
 };
-
-static void begin_interactive(void *data, struct dgde_view *view,
-                              enum dgde_cursor_mode mode, uint32_t edges) {
-  /* This function sets up an interactive move or resize operation, where the
-   * compositor stops propagating pointer events to clients and instead
-   * consumes them itself, to move or resize windows. */
-  struct dgde_server *server = data;
-
-  if (!dgde_view_is_focused(view)) {
-    /* Deny move/resize requests from unfocused clients. */
-    return;
-  }
-
-  server->grabbed_view = view;
-  dgde_cursor_set_mode(server->cursor, mode);
-
-  struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
-  struct dgde_view_position view_pos = dgde_view_position(view);
-
-  if (mode == DgdeCursor_Move) {
-    server->grab_x = pos.x - view_pos.x;
-    server->grab_y = pos.y - view_pos.y;
-  } else {
-    struct wlr_box geo_box = dgde_view_geometry(view);
-
-    double border_x = (view_pos.x + geo_box.x) +
-                      ((edges & WLR_EDGE_RIGHT) ? geo_box.width : 0);
-    double border_y = (view_pos.y + geo_box.y) +
-                      ((edges & WLR_EDGE_BOTTOM) ? geo_box.height : 0);
-    server->grab_x = pos.x - border_x;
-    server->grab_y = pos.y - border_y;
-
-    server->grab_geobox = geo_box;
-    server->grab_geobox.x += view_pos.x;
-    server->grab_geobox.y += view_pos.y;
-
-    server->resize_edges = edges;
-  }
-}
 
 static void process_cursor_move(struct dgde_server *server, uint32_t time) {
   /* Move the grabbed view to the new position. */
@@ -126,6 +112,163 @@ static void process_cursor_resize(struct dgde_server *server, uint32_t time) {
   int new_height = new_bottom - new_top;
   dgde_view_set_size(
       view, (struct dgde_view_size){.width = new_width, .height = new_height});
+}
+
+static void process_cursor_motion(struct dgde_server *server,
+                                  struct wlr_event_pointer_motion *event) {
+  /* If the mode is non-passthrough, delegate to those functions. */
+  uint32_t time = event->time_msec;
+  enum dgde_cursor_mode mode = dgde_cursor_mode(server->cursor);
+  if (mode == DgdeCursor_Move) {
+    process_cursor_move(server, time);
+    return;
+  } else if (mode == DgdeCursor_Resize) {
+    process_cursor_resize(server, time);
+    return;
+  }
+
+  /* Otherwise, find the view under the pointer and send the event along. */
+  double sx, sy;
+  struct wlr_seat *seat = server->seat;
+  struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
+  struct dgde_view *view = dgde_view_at(&server->views, pos.x, pos.y, &sx, &sy);
+
+  if (!view) {
+    /* If there's no view under the cursor, set the cursor image to a
+     * default. This is what makes the cursor image appear when you move it
+     * around the screen, not over any views. */
+    dgde_cursor_set_image(server->cursor, "left_ptr");
+  } else {
+    struct wlr_surface *surface =
+        dgde_view_surface_at(view, pos.x, pos.y, &sx, &sy);
+    bool focus_changed = seat->pointer_state.focused_surface != surface;
+    /*
+     * "Enter" the surface if necessary. This lets the client know that the
+     * cursor has entered one of its surfaces.
+     *
+     * Note that this gives the surface "pointer focus", which is distinct
+     * from keyboard focus. You get pointer focus by moving the pointer over
+     * a window.
+     */
+    wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
+    if (!focus_changed) {
+      /* The enter event contains coordinates, so we only need to notify
+       * on motion if the focus did not change. */
+      wlr_seat_pointer_notify_motion(seat, time, sx, sy);
+    }
+    /* Clear pointer focus so future button events and such are not sent to
+     * the last client to have the cursor over it. */
+    wlr_seat_pointer_clear_focus(seat);
+  }
+}
+
+static void process_cursor_motion_absolute(
+    struct dgde_server *server,
+    struct wlr_event_pointer_motion_absolute *event) {
+
+  // create a fake relative motion
+  struct wlr_event_pointer_motion ev = {
+      .delta_x = 0,
+      .delta_y = 0,
+      .time_msec = event->time_msec,
+      .device = event->device,
+  };
+  process_cursor_motion(server, &ev);
+}
+
+static void process_cursor_button(struct dgde_server *server,
+                                  struct wlr_event_pointer_button *event) {
+
+  /* Notify the client with pointer focus that a button press has occurred */
+  wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button,
+                                 event->state);
+  double sx, sy;
+  struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
+  struct view_elem *view_elem;
+  struct dgde_view *view = NULL;
+  wl_list_for_each(view_elem, &server->views, link) {
+    if (dgde_view_surface_at(view_elem->view, pos.x, pos.y, &sx, &sy) != NULL) {
+      view = view_elem->view;
+      break;
+    }
+  }
+
+  if (view != NULL && event->state == WLR_BUTTON_PRESSED) {
+    // focus the client if the button was pressed
+    dgde_view_focus(view);
+
+    // move the view to the front
+    wl_list_remove(&view_elem->link);
+    wl_list_insert(&server->views, &view_elem->link);
+  }
+}
+
+static void process_cursor_axis(struct dgde_server *server,
+                                struct wlr_event_pointer_axis *event) {
+  /* Notify the client with pointer focus of the axis event. */
+  wlr_seat_pointer_notify_axis(server->seat, event->time_msec,
+                               event->orientation, event->delta,
+                               event->delta_discrete, event->source);
+}
+
+static void process_cursor_frame(struct dgde_server *server) {
+  /* Notify the client with pointer focus of the frame event. */
+  wlr_seat_pointer_notify_frame(server->seat);
+}
+
+static bool handle_keybinding(struct dgde_server *server, xkb_keysym_t sym) {
+  /*
+   * Here we handle compositor keybindings. This is when the compositor is
+   * processing keys, rather than passing them on to the client for its own
+   * processing.
+   */
+  switch (sym) {
+  case XKB_KEY_1:
+    wl_display_terminate(server->wl_display);
+    break;
+  default:
+    return false;
+  }
+  return true;
+}
+
+static void begin_interactive(void *data, struct dgde_view *view,
+                              enum dgde_cursor_mode mode, uint32_t edges) {
+  /* This function sets up an interactive move or resize operation, where the
+   * compositor stops propagating pointer events to clients and instead
+   * consumes them itself, to move or resize windows. */
+  struct dgde_server *server = data;
+
+  if (!dgde_view_is_focused(view)) {
+    /* Deny move/resize requests from unfocused clients. */
+    return;
+  }
+
+  server->grabbed_view = view;
+  dgde_cursor_set_mode(server->cursor, mode);
+
+  struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
+  struct dgde_view_position view_pos = dgde_view_position(view);
+
+  if (mode == DgdeCursor_Move) {
+    server->grab_x = pos.x - view_pos.x;
+    server->grab_y = pos.y - view_pos.y;
+  } else {
+    struct wlr_box geo_box = dgde_view_geometry(view);
+
+    double border_x = (view_pos.x + geo_box.x) +
+                      ((edges & WLR_EDGE_RIGHT) ? geo_box.width : 0);
+    double border_y = (view_pos.y + geo_box.y) +
+                      ((edges & WLR_EDGE_BOTTOM) ? geo_box.height : 0);
+    server->grab_x = pos.x - border_x;
+    server->grab_y = pos.y - border_y;
+
+    server->grab_geobox = geo_box;
+    server->grab_geobox.x += view_pos.x;
+    server->grab_geobox.y += view_pos.y;
+
+    server->resize_edges = edges;
+  }
 }
 
 static void output_frame(struct wl_listener *listener, void *data) {
@@ -376,122 +519,4 @@ void dgde_server_destroy(struct dgde_server *server) {
   wl_display_destroy(server->wl_display);
 
   free(server);
-}
-
-void process_cursor_motion(struct dgde_server *server,
-                           struct wlr_event_pointer_motion *event) {
-  /* If the mode is non-passthrough, delegate to those functions. */
-  uint32_t time = event->time_msec;
-  enum dgde_cursor_mode mode = dgde_cursor_mode(server->cursor);
-  if (mode == DgdeCursor_Move) {
-    process_cursor_move(server, time);
-    return;
-  } else if (mode == DgdeCursor_Resize) {
-    process_cursor_resize(server, time);
-    return;
-  }
-
-  /* Otherwise, find the view under the pointer and send the event along. */
-  double sx, sy;
-  struct wlr_seat *seat = server->seat;
-  struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
-  struct dgde_view *view = dgde_view_at(&server->views, pos.x, pos.y, &sx, &sy);
-
-  if (!view) {
-    /* If there's no view under the cursor, set the cursor image to a
-     * default. This is what makes the cursor image appear when you move it
-     * around the screen, not over any views. */
-    dgde_cursor_set_image(server->cursor, "left_ptr");
-  } else {
-    struct wlr_surface *surface =
-        dgde_view_surface_at(view, pos.x, pos.y, &sx, &sy);
-    bool focus_changed = seat->pointer_state.focused_surface != surface;
-    /*
-     * "Enter" the surface if necessary. This lets the client know that the
-     * cursor has entered one of its surfaces.
-     *
-     * Note that this gives the surface "pointer focus", which is distinct
-     * from keyboard focus. You get pointer focus by moving the pointer over
-     * a window.
-     */
-    wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
-    if (!focus_changed) {
-      /* The enter event contains coordinates, so we only need to notify
-       * on motion if the focus did not change. */
-      wlr_seat_pointer_notify_motion(seat, time, sx, sy);
-    }
-    /* Clear pointer focus so future button events and such are not sent to
-     * the last client to have the cursor over it. */
-    wlr_seat_pointer_clear_focus(seat);
-  }
-}
-
-void process_cursor_motion_absolute(
-    struct dgde_server *server,
-    struct wlr_event_pointer_motion_absolute *event) {
-
-  // create a fake relative motion
-  struct wlr_event_pointer_motion ev = {
-      .delta_x = 0,
-      .delta_y = 0,
-      .time_msec = event->time_msec,
-      .device = event->device,
-  };
-  process_cursor_motion(server, &ev);
-}
-
-void process_cursor_button(struct dgde_server *server,
-                           struct wlr_event_pointer_button *event) {
-
-  /* Notify the client with pointer focus that a button press has occurred */
-  wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button,
-                                 event->state);
-  double sx, sy;
-  struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
-  struct view_elem *view_elem;
-  struct dgde_view *view = NULL;
-  wl_list_for_each(view_elem, &server->views, link) {
-    if (dgde_view_surface_at(view_elem->view, pos.x, pos.y, &sx, &sy) != NULL) {
-      view = view_elem->view;
-      break;
-    }
-  }
-
-  if (view != NULL && event->state == WLR_BUTTON_PRESSED) {
-    // focus the client if the button was pressed
-    dgde_view_focus(view);
-
-    // move the view to the front
-    wl_list_remove(&view_elem->link);
-    wl_list_insert(&server->views, &view_elem->link);
-  }
-}
-
-void process_cursor_axis(struct dgde_server *server,
-                         struct wlr_event_pointer_axis *event) {
-  /* Notify the client with pointer focus of the axis event. */
-  wlr_seat_pointer_notify_axis(server->seat, event->time_msec,
-                               event->orientation, event->delta,
-                               event->delta_discrete, event->source);
-}
-
-void process_cursor_frame(struct dgde_server *server) {
-  /* Notify the client with pointer focus of the frame event. */
-  wlr_seat_pointer_notify_frame(server->seat);
-}
-
-bool handle_keybinding(struct dgde_server *server, xkb_keysym_t sym) {
-  /*
-   * Here we handle compositor keybindings. This is when the compositor is
-   * processing keys, rather than passing them on to the client for its own
-   * processing.
-   */
-  switch (sym) {
-  case XKB_KEY_1:
-    wl_display_terminate(server->wl_display);
-    break;
-  default:
-    return false;
-  }
-  return true;
 }

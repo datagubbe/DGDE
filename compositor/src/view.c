@@ -223,7 +223,6 @@ struct render_data {
 
 static void render_surface(struct wlr_surface *surface, int sx, int sy,
                            void *data) {
-  /* This function is called for every surface that needs to be rendered. */
   struct render_data *rdata = data;
   const struct dgde_view *view = rdata->view;
   struct wlr_output *output = rdata->output;
@@ -286,9 +285,9 @@ void dgde_view_render(const struct dgde_view *view, struct wlr_output *output,
                       struct wlr_output_layout *output_layout,
                       const struct timespec *now) {
   if (!view->mapped) {
-    /* An unmapped view should not be rendered. */
     return;
   }
+
   struct render_data rdata = {
       .output_layout = output_layout,
       .output = output,
@@ -296,7 +295,7 @@ void dgde_view_render(const struct dgde_view *view, struct wlr_output *output,
       .renderer = view->xdg_surface->surface->renderer,
       .when = now,
   };
-  /* This calls our render_surface function for each surface among the
-   * xdg_surface's toplevel and popups. */
+
+  // This handles subsurfaces and popup surfaces as well
   wlr_xdg_surface_for_each_surface(view->xdg_surface, render_surface, &rdata);
 }
