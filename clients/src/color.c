@@ -170,7 +170,7 @@ static void handle_ping(void *data, struct xdg_wm_base *xdg_base,
 static void handle_configure(void *data, struct xdg_toplevel *toplevel,
                              int32_t width, int32_t height,
                              struct wl_array *states) {
-  if ((width == height) == 0) {
+  if (width == 0 && height == 0) {
     return;
   }
 
@@ -264,12 +264,12 @@ int main(int argc, char **argv) {
 
   xdg_toplevel_set_title(window.xdg_toplevel, "This is a color!");
 
+  init_egl(display, &window);
+  create_window(&window);
+
   // recieve the configure events for the xdg surface
   wl_surface_commit(window.surface);
   wl_display_roundtrip(display);
-
-  init_egl(display, &window);
-  create_window(&window);
 
   draw(&window, color);
   while (wl_display_dispatch(display) != -1) {

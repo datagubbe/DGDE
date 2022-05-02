@@ -4,7 +4,10 @@
 #include "cursor.h"
 #include "keyboard.h"
 #include "view.h"
+#include "workspace.h"
 
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
@@ -14,6 +17,7 @@
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/edges.h>
+#include <wlr/util/log.h>
 
 struct dgde_server {
   struct wl_display *wl_display;
@@ -22,7 +26,6 @@ struct dgde_server {
 
   struct wlr_xdg_shell *xdg_shell;
   struct wl_listener new_xdg_surface;
-  struct wl_list views;
 
   struct dgde_cursor *cursor;
 
@@ -30,10 +33,6 @@ struct dgde_server {
   struct wl_listener new_input;
   struct wl_listener request_set_selection;
   struct wl_list keyboards;
-  struct dgde_view *grabbed_view;
-  double grab_x, grab_y;
-  struct wlr_box grab_geobox;
-  uint32_t resize_edges;
 
   struct wlr_output_layout *output_layout;
   struct wl_list outputs;
@@ -45,120 +44,61 @@ struct dgde_output {
   struct dgde_server *server;
   struct wlr_output *wlr_output;
   struct wl_listener frame;
+  struct wl_listener mode;
+
+  struct dgde_workspace *workspaces[16];
+  uint32_t num_workspaces;
+  uint32_t active_workspace;
 };
 
-struct view_elem {
-  struct dgde_view *view;
-  struct wl_list link;
-};
+static void setup_workspaces(struct dgde_server *server,
+                             struct dgde_output *output,
+                             uint32_t num_workspaces,
+                             const char *name_pattern) {
+  output->num_workspaces = num_workspaces > 16 ? 16 : num_workspaces;
+  char buf[256];
 
-static void process_cursor_move(struct dgde_server *server, uint32_t time) {
-  /* Move the grabbed view to the new position. */
-  struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
-  dgde_view_set_position(
-      server->grabbed_view,
-      (struct dgde_view_position){.x = (pos.x - server->grab_x),
-                                  .y = (pos.y - server->grab_y)});
+  int width, height;
+  wlr_output_effective_resolution(output->wlr_output, &width, &height);
+
+  for (uint32_t i = 0, e = output->num_workspaces; i < e; ++i) {
+    snprintf(buf, 256, name_pattern, i);
+    wlr_log(WLR_DEBUG,
+            "creating workspace \"%s\" on output \"%s\" (%p) with geom %dx%d",
+            buf, output->wlr_output->description, output, width, height);
+    output->workspaces[i] =
+        dgde_workspace_create(buf, server->seat, width, height);
+  }
 }
 
-static void process_cursor_resize(struct dgde_server *server, uint32_t time) {
-  /*
-   * Resizing the grabbed view can be a little bit complicated, because we
-   * could be resizing from any corner or edge. This not only resizes the view
-   * on one or two axes, but can also move the view if you resize from the top
-   * or left edges (or top-left corner).
-   *
-   * Note that I took some shortcuts here. In a more fleshed-out compositor,
-   * you'd wait for the client to prepare a buffer at the new size, then
-   * commit any movement that was prepared.
-   */
-  struct dgde_view *view = server->grabbed_view;
-  struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
-  double border_x = pos.x - server->grab_x;
-  double border_y = pos.y - server->grab_y;
-  int new_left = server->grab_geobox.x;
-  int new_right = server->grab_geobox.x + server->grab_geobox.width;
-  int new_top = server->grab_geobox.y;
-  int new_bottom = server->grab_geobox.y + server->grab_geobox.height;
-
-  if (server->resize_edges & WLR_EDGE_TOP) {
-    new_top = border_y;
-    if (new_top >= new_bottom) {
-      new_top = new_bottom - 1;
-    }
-  } else if (server->resize_edges & WLR_EDGE_BOTTOM) {
-    new_bottom = border_y;
-    if (new_bottom <= new_top) {
-      new_bottom = new_top + 1;
-    }
-  }
-  if (server->resize_edges & WLR_EDGE_LEFT) {
-    new_left = border_x;
-    if (new_left >= new_right) {
-      new_left = new_right - 1;
-    }
-  } else if (server->resize_edges & WLR_EDGE_RIGHT) {
-    new_right = border_x;
-    if (new_right <= new_left) {
-      new_right = new_left + 1;
+static struct dgde_output *
+dgde_output_from_wlr_output(const struct wlr_output *output,
+                            const struct wl_list outputs) {
+  struct dgde_output *res = NULL;
+  wl_list_for_each(res, &outputs, link) {
+    if (res->wlr_output == output) {
+      return res;
     }
   }
 
-  struct wlr_box geo_box = dgde_view_geometry(view);
-  dgde_view_set_position(view,
-                         (struct dgde_view_position){.x = new_left = geo_box.x,
-                                                     .y = new_top = geo_box.y});
-  int new_width = new_right - new_left;
-  int new_height = new_bottom - new_top;
-  dgde_view_set_size(
-      view, (struct dgde_view_size){.width = new_width, .height = new_height});
+  return NULL;
 }
 
 static void process_cursor_motion(struct dgde_server *server,
                                   struct wlr_event_pointer_motion *event) {
-  /* If the mode is non-passthrough, delegate to those functions. */
-  uint32_t time = event->time_msec;
-  enum dgde_cursor_mode mode = dgde_cursor_mode(server->cursor);
-  if (mode == DgdeCursor_Move) {
-    process_cursor_move(server, time);
-    return;
-  } else if (mode == DgdeCursor_Resize) {
-    process_cursor_resize(server, time);
-    return;
-  }
-
-  /* Otherwise, find the view under the pointer and send the event along. */
-  double sx, sy;
-  struct wlr_seat *seat = server->seat;
+  // only send event to current workspace
   struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
-  struct dgde_view *view = dgde_view_at(&server->views, pos.x, pos.y, &sx, &sy);
 
-  if (!view) {
-    /* If there's no view under the cursor, set the cursor image to a
-     * default. This is what makes the cursor image appear when you move it
-     * around the screen, not over any views. */
-    dgde_cursor_set_image(server->cursor, "left_ptr");
-  } else {
-    struct wlr_surface *surface =
-        dgde_view_surface_at(view, pos.x, pos.y, &sx, &sy);
-    bool focus_changed = seat->pointer_state.focused_surface != surface;
-    /*
-     * "Enter" the surface if necessary. This lets the client know that the
-     * cursor has entered one of its surfaces.
-     *
-     * Note that this gives the surface "pointer focus", which is distinct
-     * from keyboard focus. You get pointer focus by moving the pointer over
-     * a window.
-     */
-    wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
-    if (!focus_changed) {
-      /* The enter event contains coordinates, so we only need to notify
-       * on motion if the focus did not change. */
-      wlr_seat_pointer_notify_motion(seat, time, sx, sy);
+  struct wlr_output *wlr_output =
+      wlr_output_layout_output_at(server->output_layout, pos.x, pos.y);
+  if (wlr_output != NULL) {
+
+    struct dgde_output *res =
+        dgde_output_from_wlr_output(wlr_output, server->outputs);
+    if (res != NULL && res->num_workspaces > 0) {
+      struct dgde_workspace *ws = res->workspaces[res->active_workspace];
+      dgde_workspace_on_cursor_motion(ws, server->cursor, event);
     }
-    /* Clear pointer focus so future button events and such are not sent to
-     * the last client to have the cursor over it. */
-    wlr_seat_pointer_clear_focus(seat);
   }
 }
 
@@ -182,25 +122,6 @@ static void process_cursor_button(struct dgde_server *server,
   /* Notify the client with pointer focus that a button press has occurred */
   wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button,
                                  event->state);
-  double sx, sy;
-  struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
-  struct view_elem *view_elem;
-  struct dgde_view *view = NULL;
-  wl_list_for_each(view_elem, &server->views, link) {
-    if (dgde_view_surface_at(view_elem->view, pos.x, pos.y, &sx, &sy) != NULL) {
-      view = view_elem->view;
-      break;
-    }
-  }
-
-  if (view != NULL && event->state == WLR_BUTTON_PRESSED) {
-    // focus the client if the button was pressed
-    dgde_view_focus(view);
-
-    // move the view to the front
-    wl_list_remove(&view_elem->link);
-    wl_list_insert(&server->views, &view_elem->link);
-  }
 }
 
 static void process_cursor_axis(struct dgde_server *server,
@@ -226,49 +147,27 @@ static bool handle_keybinding(struct dgde_server *server, xkb_keysym_t sym) {
   case XKB_KEY_1:
     wl_display_terminate(server->wl_display);
     break;
+  case XKB_KEY_2:
+    if (fork() == 0) {
+      execlp("color", "color", "-c", "red", NULL);
+    }
+    break;
+  case XKB_KEY_3:
+    if (fork() == 0) {
+      execlp("color", "color", "-c", "green", NULL);
+    }
+    break;
+
+  case XKB_KEY_4:
+    if (fork() == 0) {
+      execlp("color", "color", "-c", "blue", NULL);
+    }
+    break;
+
   default:
     return false;
   }
   return true;
-}
-
-static void begin_interactive(void *data, struct dgde_view *view,
-                              enum dgde_cursor_mode mode, uint32_t edges) {
-  /* This function sets up an interactive move or resize operation, where the
-   * compositor stops propagating pointer events to clients and instead
-   * consumes them itself, to move or resize windows. */
-  struct dgde_server *server = data;
-
-  if (!dgde_view_is_focused(view)) {
-    /* Deny move/resize requests from unfocused clients. */
-    return;
-  }
-
-  server->grabbed_view = view;
-  dgde_cursor_set_mode(server->cursor, mode);
-
-  struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
-  struct dgde_view_position view_pos = dgde_view_position(view);
-
-  if (mode == DgdeCursor_Move) {
-    server->grab_x = pos.x - view_pos.x;
-    server->grab_y = pos.y - view_pos.y;
-  } else {
-    struct wlr_box geo_box = dgde_view_geometry(view);
-
-    double border_x = (view_pos.x + geo_box.x) +
-                      ((edges & WLR_EDGE_RIGHT) ? geo_box.width : 0);
-    double border_y = (view_pos.y + geo_box.y) +
-                      ((edges & WLR_EDGE_BOTTOM) ? geo_box.height : 0);
-    server->grab_x = pos.x - border_x;
-    server->grab_y = pos.y - border_y;
-
-    server->grab_geobox = geo_box;
-    server->grab_geobox.x += view_pos.x;
-    server->grab_geobox.y += view_pos.y;
-
-    server->resize_edges = edges;
-  }
 }
 
 static void output_frame(struct wl_listener *listener, void *data) {
@@ -293,19 +192,16 @@ static void output_frame(struct wl_listener *listener, void *data) {
   float color[4] = {0.3, 0.3, 0.3, 1.0};
   wlr_renderer_clear(renderer, color);
 
-  /* Each subsequent window we render is rendered on top of the last. Because
-   * our view list is ordered front-to-back, we iterate over it backwards. */
-  struct view_elem *view;
-  wl_list_for_each_reverse(view, &output->server->views, link) {
-    dgde_view_render(view->view, output->wlr_output,
-                     output->server->output_layout, &now);
-  }
+  struct dgde_workspace *ws = output->workspaces[output->active_workspace];
+  dgde_workspace_render(ws, output->server->renderer, output->wlr_output,
+                        output->server->output_layout, now);
 
-  /* Hardware cursors are rendered by the GPU on a separate plane, and can be
-   * moved around without re-rendering what's beneath them - which is more
-   * efficient. However, not all hardware supports hardware cursors. For this
-   * reason, wlroots provides a software fallback, which we ask it to render
-   * here. wlr_cursor handles configuring hardware vs software cursors for you,
+  /* Hardware cursors are rendered by the GPU on a separate plane, and can
+   * be moved around without re-rendering what's beneath them - which is
+   * more efficient. However, not all hardware supports hardware cursors.
+   * For this reason, wlroots provides a software fallback, which we ask it
+   * to render here. wlr_cursor handles configuring hardware vs software
+   * cursors for you,
    * and this function is a no-op when hardware cursors are in use. */
   wlr_output_render_software_cursors(output->wlr_output, NULL);
 
@@ -315,11 +211,43 @@ static void output_frame(struct wl_listener *listener, void *data) {
   wlr_output_commit(output->wlr_output);
 }
 
+static void output_mode(struct wl_listener *listener, void *data) {
+  struct dgde_output *output = wl_container_of(listener, output, mode);
+  struct wlr_output *wlr_output = data;
+
+  int width, height;
+  wlr_output_effective_resolution(output->wlr_output, &width, &height);
+
+  wlr_log(WLR_DEBUG, "new output mode for %s: %dx%d", wlr_output->description,
+          width, height);
+
+  for (uint32_t i = 0, e = output->num_workspaces; i < e; ++i) {
+    dgde_workspace_resize(output->workspaces[i], width, height);
+  }
+}
+
 static void new_output(struct wl_listener *listener, void *data) {
   /* This event is rasied by the backend when a new output (aka a display or
    * monitor) becomes available. */
   struct dgde_server *server = wl_container_of(listener, server, new_output);
   struct wlr_output *wlr_output = data;
+
+  wlr_log(WLR_DEBUG, "new output: %s", wlr_output->description);
+
+  /* Allocates and configures our state for this output */
+  struct dgde_output *output = calloc(1, sizeof(struct dgde_output));
+  output->wlr_output = wlr_output;
+  output->server = server;
+
+  setup_workspaces(server, output, 4, "Workspace %d");
+
+  /* Sets up a listener for the frame notify event. */
+  output->frame.notify = output_frame;
+  wl_signal_add(&wlr_output->events.frame, &output->frame);
+  output->mode.notify = output_mode;
+  wl_signal_add(&wlr_output->events.mode, &output->mode);
+
+  wl_list_insert(&server->outputs, &output->link);
 
   /* Some backends don't have modes. DRM+KMS does, and we need to set a mode
    * before we can use the output. The mode is a tuple of (width, height,
@@ -334,15 +262,6 @@ static void new_output(struct wl_listener *listener, void *data) {
       return;
     }
   }
-
-  /* Allocates and configures our state for this output */
-  struct dgde_output *output = calloc(1, sizeof(struct dgde_output));
-  output->wlr_output = wlr_output;
-  output->server = server;
-  /* Sets up a listener for the frame notify event. */
-  output->frame.notify = output_frame;
-  wl_signal_add(&wlr_output->events.frame, &output->frame);
-  wl_list_insert(&server->outputs, &output->link);
 
   /* Adds this to the output layout. The add_auto function arranges outputs
    * from left-to-right in the order they appear. A more sophisticated
@@ -366,14 +285,13 @@ static void new_xdg_surface(struct wl_listener *listener, void *data) {
     return;
   }
 
-  /* Allocate a view for this surface */
-  struct dgde_view *view = dgde_view_create(xdg_surface, server->seat);
-  dgde_view_add_interaction_handler(view, begin_interactive, server);
+  struct dgde_output *o = wl_container_of(server->outputs.next, o, link);
 
-  // Add it to the list of views. TODO: remove when view is destroyed
-  struct view_elem *elem = calloc(1, sizeof(struct view_elem));
-  elem->view = view;
-  wl_list_insert(&server->views, &elem->link);
+  struct dgde_workspace *workspace = o->workspaces[o->active_workspace];
+  wlr_log(WLR_DEBUG, "inserting view into workspace %d on output %s (%p)",
+          o->active_workspace, o->wlr_output->description, o);
+
+  dgde_workspace_add_view(workspace, xdg_surface);
 }
 
 static void new_input(struct wl_listener *listener, void *data) {
@@ -396,9 +314,9 @@ static void new_input(struct wl_listener *listener, void *data) {
   default:
     break;
   }
-  /* We need to let the wlr_seat know what our capabilities are, which is
-   * communiciated to the client. In TinyWL we always have a cursor, even if
-   * there are no pointer devices, so we always include that capability. */
+
+  // let the seat know what we can do (have pointer by default even if there are
+  // no pointer hardware devices)
   uint32_t caps = WL_SEAT_CAPABILITY_POINTER;
   if (!wl_list_empty(&server->keyboards)) {
     caps |= WL_SEAT_CAPABILITY_KEYBOARD;
@@ -456,13 +374,6 @@ struct dgde_server *dgde_server_create(const char *seat_name) {
   server->new_output.notify = new_output;
   wl_signal_add(&server->backend->events.new_output, &server->new_output);
 
-  // set up an empty list of views and start listening to xdg-shell events
-  wl_list_init(&server->views);
-  server->xdg_shell = wlr_xdg_shell_create(server->wl_display);
-  server->new_xdg_surface.notify = new_xdg_surface;
-  wl_signal_add(&server->xdg_shell->events.new_surface,
-                &server->new_xdg_surface);
-
   /*
    * Configures a seat, which is a single "seat" at which a user sits and
    * operates the computer. This conceptually includes up to one keyboard,
@@ -476,6 +387,11 @@ struct dgde_server *dgde_server_create(const char *seat_name) {
   server->request_set_selection.notify = seat_request_set_selection;
   wl_signal_add(&server->seat->events.request_set_selection,
                 &server->request_set_selection);
+
+  server->xdg_shell = wlr_xdg_shell_create(server->wl_display);
+  server->new_xdg_surface.notify = new_xdg_surface;
+  wl_signal_add(&server->xdg_shell->events.new_surface,
+                &server->new_xdg_surface);
 
   // create a cursor
   struct dgde_cursor *cursor =

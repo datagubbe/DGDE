@@ -3,7 +3,7 @@ project(
   'c',
   default_options: [
     'c_std=c11',
-    'werror=true',
+    'werror=true'
   ]
 )
 
@@ -30,6 +30,8 @@ executable(
     'src/view.c',
     'src/server.c',
     'src/keyboard.c',
+    'src/workspace.c',
+    'src/decorations.c',
     xdg_shell_header,
   ],
   dependencies: [wlroots, wayland, libudev, pixman, xkbcommon],
