@@ -7,30 +7,10 @@
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 
-#define MAX_CURSOR_HANDLERS 16
-
-struct dgde_cursor {
-  struct wlr_cursor *inner;
-  struct wlr_xcursor_manager *xcursor;
-  struct wlr_seat *seat;
-
-  struct wl_listener motion;
-  struct wl_listener motion_absolute;
-  struct wl_listener button;
-  struct wl_listener axis;
-  struct wl_listener frame;
-  struct wl_listener request_cursor;
-
-  struct dgde_cursor_handler handlers[MAX_CURSOR_HANDLERS];
-  uint32_t num_handlers;
-
-  enum dgde_cursor_mode mode;
-};
-
 static void on_motion(struct wl_listener *listener, void *data) {
   /* This event is forwarded by the cursor when a pointer emits a _relative_
    * pointer motion event (i.e. a delta) */
-  struct dgde_cursor *cursor = wl_container_of(listener, cursor, motion);
+  struct cursor *cursor = wl_container_of(listener, cursor, motion);
   struct wlr_event_pointer_motion *event = data;
   /* The cursor doesn't move unless we tell it to. The cursor automatically
    * handles constraining the motion to the output layout, as well as any
@@ -40,12 +20,7 @@ static void on_motion(struct wl_listener *listener, void *data) {
   wlr_cursor_move(cursor->inner, event->device, event->delta_x, event->delta_y);
 
   // ☎️
-  for (uint32_t i = 0, e = cursor->num_handlers; i < e; ++i) {
-    struct dgde_cursor_handler *handler = &cursor->handlers[i];
-    if (handler->motion != NULL) {
-      handler->motion(handler->userdata, event);
-    }
-  }
+  wl_signal_emit(&cursor->events.motion, data);
 }
 
 static void on_motion_absolute(struct wl_listener *listener, void *data) {
@@ -55,73 +30,44 @@ static void on_motion_absolute(struct wl_listener *listener, void *data) {
    * move the mouse over the window. You could enter the window from any edge,
    * so we have to warp the mouse there. There is also some hardware which
    * emits these events. */
-  struct dgde_cursor *cursor =
-      wl_container_of(listener, cursor, motion_absolute);
+  struct cursor *cursor = wl_container_of(listener, cursor, motion_absolute);
   struct wlr_event_pointer_motion_absolute *event = data;
   wlr_cursor_warp_absolute(cursor->inner, event->device, event->x, event->y);
-  // ☎️
-  for (uint32_t i = 0, e = cursor->num_handlers; i < e; ++i) {
-    struct dgde_cursor_handler *handler = &cursor->handlers[i];
-    if (handler->motion_absolute != NULL) {
-      handler->motion_absolute(handler->userdata, event);
-    }
-  }
+
+  wl_signal_emit(&cursor->events.motion_absolute, data);
 }
 
 static void on_button(struct wl_listener *listener, void *data) {
   /* This event is forwarded by the cursor when a pointer emits a button
    * event. */
-  struct dgde_cursor *cursor = wl_container_of(listener, cursor, button);
-  struct wlr_event_pointer_button *event = data;
+  struct cursor *cursor = wl_container_of(listener, cursor, button);
 
   // ☎️
-  for (uint32_t i = 0, e = cursor->num_handlers; i < e; ++i) {
-    struct dgde_cursor_handler *handler = &cursor->handlers[i];
-    if (handler->button != NULL) {
-      handler->button(handler->userdata, event);
-    }
-  }
-
-  // if the mouse button was released, go back to normal
-  if (event->state == WLR_BUTTON_RELEASED) {
-    dgde_cursor_reset_mode(cursor);
-  }
+  wl_signal_emit(&cursor->events.button, data);
 }
 
 static void on_axis(struct wl_listener *listener, void *data) {
   /* This event is forwarded by the cursor when a pointer emits an axis event,
    * for example when you move the scroll wheel. */
-  struct dgde_cursor *cursor = wl_container_of(listener, cursor, axis);
-  struct wlr_event_pointer_axis *event = data;
+  struct cursor *cursor = wl_container_of(listener, cursor, axis);
   // TODO: something?
 
   // ☎️
-  for (uint32_t i = 0, e = cursor->num_handlers; i < e; ++i) {
-    struct dgde_cursor_handler *handler = &cursor->handlers[i];
-    if (handler->axis != NULL) {
-      handler->axis(handler->userdata, event);
-    }
-  }
+  wl_signal_emit(&cursor->events.axis, data);
 }
 
 static void on_frame(struct wl_listener *listener, void *data) {
   /* This event is forwarded by the cursor when a pointer emits an axis event,
    * for example when you move the scroll wheel. */
-  struct dgde_cursor *cursor = wl_container_of(listener, cursor, frame);
+  struct cursor *cursor = wl_container_of(listener, cursor, frame);
   // TODO: something?
 
   // ☎️
-  for (uint32_t i = 0, e = cursor->num_handlers; i < e; ++i) {
-    struct dgde_cursor_handler *handler = &cursor->handlers[i];
-    if (handler->frame != NULL) {
-      handler->frame(handler->userdata);
-    }
-  }
+  wl_signal_emit(&cursor->events.frame, data);
 }
 
 static void seat_request_cursor(struct wl_listener *listener, void *data) {
-  struct dgde_cursor *cursor =
-      wl_container_of(listener, cursor, request_cursor);
+  struct cursor *cursor = wl_container_of(listener, cursor, request_cursor);
   /* This event is rasied by the seat when a client provides a cursor image */
   struct wlr_seat_pointer_request_set_cursor_event *event = data;
   struct wlr_seat_client *focused_client =
@@ -133,13 +79,13 @@ static void seat_request_cursor(struct wl_listener *listener, void *data) {
      * provided surface as the cursor image. It will set the hardware cursor
      * on the output that it's currently on and continue to do so as the
      * cursor moves between outputs. */
-    dgde_cursor_set_surface(cursor, event);
+    cursor_set_surface(cursor, event);
   }
 }
 
-struct dgde_cursor *dgde_cursor_create(struct wlr_output_layout *output_layout,
-                                       struct wlr_seat *seat) {
-  struct dgde_cursor *cursor = calloc(1, sizeof(struct dgde_cursor));
+struct cursor *cursor_create(struct wlr_output_layout *output_layout,
+                             struct wlr_seat *seat) {
+  struct cursor *cursor = calloc(1, sizeof(struct cursor));
 
   cursor->inner = wlr_cursor_create();
   wlr_cursor_attach_output_layout(cursor->inner, output_layout);
@@ -152,8 +98,6 @@ struct dgde_cursor *dgde_cursor_create(struct wlr_output_layout *output_layout,
   wlr_xcursor_manager_load(cursor->xcursor, 1);
 
   cursor->seat = seat;
-  cursor->mode = DgdeCursor_Passthrough;
-  cursor->num_handlers = 0;
 
   // set up all internal events
   cursor->motion.notify = on_motion;
@@ -175,36 +119,21 @@ struct dgde_cursor *dgde_cursor_create(struct wlr_output_layout *output_layout,
   cursor->request_cursor.notify = seat_request_cursor;
   wl_signal_add(&seat->events.request_set_cursor, &cursor->request_cursor);
 
+  wl_signal_init(&cursor->events.axis);
+  wl_signal_init(&cursor->events.button);
+  wl_signal_init(&cursor->events.frame);
+  wl_signal_init(&cursor->events.motion);
+  wl_signal_init(&cursor->events.motion_absolute);
+
   return cursor;
 }
 
-struct dgde_cursor_position
-dgde_cursor_position(const struct dgde_cursor *cursor) {
-  return (struct dgde_cursor_position){.x = cursor->inner->x,
-                                       .y = cursor->inner->y};
+struct cursor_position cursor_position(const struct cursor *cursor) {
+  return (struct cursor_position){.x = cursor->inner->x, .y = cursor->inner->y};
 }
 
-enum dgde_cursor_mode dgde_cursor_mode(const struct dgde_cursor *cursor) {
-  return cursor->mode;
-}
-
-enum dgde_cursor_mode dgde_cursor_reset_mode(struct dgde_cursor *cursor) {
-  enum dgde_cursor_mode prev_mode = cursor->mode;
-  cursor->mode = DgdeCursor_Passthrough;
-
-  return prev_mode;
-}
-
-enum dgde_cursor_mode dgde_cursor_set_mode(struct dgde_cursor *cursor,
-                                           enum dgde_cursor_mode mode) {
-  enum dgde_cursor_mode prev_mode = cursor->mode;
-  cursor->mode = mode;
-
-  return prev_mode;
-}
-
-void dgde_cursor_new_pointer(struct dgde_cursor *cursor,
-                             struct wlr_input_device *device) {
+void cursor_new_pointer(struct cursor *cursor,
+                        struct wlr_input_device *device) {
   /* We don't do anything special with pointers. All of our pointer handling
    * is proxied through wlr_cursor. On another compositor, you might take this
    * opportunity to do libinput configuration on the device to set
@@ -212,25 +141,18 @@ void dgde_cursor_new_pointer(struct dgde_cursor *cursor,
   wlr_cursor_attach_input_device(cursor->inner, device);
 }
 
-void dgde_cursor_set_surface(
-    struct dgde_cursor *cursor,
+void cursor_set_surface(
+    struct cursor *cursor,
     struct wlr_seat_pointer_request_set_cursor_event *event) {
   wlr_cursor_set_surface(cursor->inner, event->surface, event->hotspot_x,
                          event->hotspot_y);
 }
 
-void dgde_cursor_add_handler(struct dgde_cursor *cursor,
-                             const struct dgde_cursor_handler *handler) {
-  if (cursor->num_handlers < MAX_CURSOR_HANDLERS) {
-    cursor->handlers[cursor->num_handlers++] = *handler;
-  }
-}
-
-void dgde_cursor_destroy(struct dgde_cursor *cursor) {
+void cursor_destroy(struct cursor *cursor) {
   wlr_xcursor_manager_destroy(cursor->xcursor);
   wlr_cursor_destroy(cursor->inner);
 }
 
-void dgde_cursor_set_image(struct dgde_cursor *cursor, const char *image) {
+void cursor_set_image(struct cursor *cursor, const char *image) {
   wlr_xcursor_manager_set_cursor_image(cursor->xcursor, image, cursor->inner);
 }

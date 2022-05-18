@@ -1,64 +1,50 @@
 #ifndef CURSOR_H
 #define CURSOR_H
 
+#include "wayland-server-core.h"
 #include <stdint.h>
 
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_seat.h>
 
-struct dgde_cursor;
+struct cursor {
+  struct wlr_cursor *inner;
+  struct wlr_xcursor_manager *xcursor;
+  struct wlr_seat *seat;
 
-enum dgde_cursor_mode {
-  DgdeCursor_Passthrough,
-  DgdeCursor_Move,
-  DgdeCursor_Resize,
+  struct wl_listener axis;
+  struct wl_listener button;
+  struct wl_listener frame;
+  struct wl_listener motion;
+  struct wl_listener motion_absolute;
+  struct wl_listener request_cursor;
+
+  struct {
+    struct wl_signal axis;
+    struct wl_signal button;
+    struct wl_signal frame;
+    struct wl_signal motion;
+    struct wl_signal motion_absolute;
+  } events;
 };
 
-struct dgde_cursor_position {
+struct cursor_position {
   double x;
   double y;
 };
 
-typedef void (*dgde_cursor_motion_cb)(void *,
-                                      struct wlr_event_pointer_motion *);
-typedef void (*dgde_cursor_motion_absolute_cb)(
-    void *, struct wlr_event_pointer_motion_absolute *);
-typedef void (*dgde_cursor_button_cb)(void *,
-                                      struct wlr_event_pointer_button *);
-typedef void (*dgde_cursor_axis_cb)(void *, struct wlr_event_pointer_axis *);
-typedef void (*dgde_cursor_frame_cb)(void *);
+struct cursor *cursor_create(struct wlr_output_layout *output_layout,
+                             struct wlr_seat *seat);
 
-struct dgde_cursor_handler {
-  void *userdata;
-  dgde_cursor_motion_cb motion;
-  dgde_cursor_motion_absolute_cb motion_absolute;
-  dgde_cursor_button_cb button;
-  dgde_cursor_axis_cb axis;
-  dgde_cursor_frame_cb frame;
-};
-
-struct dgde_cursor *dgde_cursor_create(struct wlr_output_layout *output_layout,
-                                       struct wlr_seat *seat);
-
-void dgde_cursor_new_pointer(struct dgde_cursor *cursor,
-                             struct wlr_input_device *device);
-void dgde_cursor_set_surface(
-    struct dgde_cursor *cursor,
+void cursor_new_pointer(struct cursor *cursor, struct wlr_input_device *device);
+void cursor_set_surface(
+    struct cursor *cursor,
     struct wlr_seat_pointer_request_set_cursor_event *event);
 
-struct dgde_cursor_position
-dgde_cursor_position(const struct dgde_cursor *cursor);
+struct cursor_position cursor_position(const struct cursor *cursor);
 
-enum dgde_cursor_mode dgde_cursor_mode(const struct dgde_cursor *cursor);
-enum dgde_cursor_mode dgde_cursor_set_mode(struct dgde_cursor *cursor,
-                                           enum dgde_cursor_mode mode);
-enum dgde_cursor_mode dgde_cursor_reset_mode(struct dgde_cursor *cursor);
-
-void dgde_cursor_add_handler(struct dgde_cursor *cursor,
-                             const struct dgde_cursor_handler *handler);
-
-void dgde_cursor_set_image(struct dgde_cursor *cursor, const char *image);
-void dgde_cursor_destroy(struct dgde_cursor *cursor);
+void cursor_set_image(struct cursor *cursor, const char *image);
+void cursor_destroy(struct cursor *cursor);
 
 #endif

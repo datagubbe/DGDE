@@ -4,7 +4,7 @@
 #include "cursor.h"
 #include "keyboard.h"
 #include "view.h"
-#include "workspace.h"
+#include "workspace/workspace.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -19,40 +19,7 @@
 #include <wlr/util/edges.h>
 #include <wlr/util/log.h>
 
-struct dgde_server {
-  struct wl_display *wl_display;
-  struct wlr_backend *backend;
-  struct wlr_renderer *renderer;
-
-  struct wlr_xdg_shell *xdg_shell;
-  struct wl_listener new_xdg_surface;
-
-  struct dgde_cursor *cursor;
-
-  struct wlr_seat *seat;
-  struct wl_listener new_input;
-  struct wl_listener request_set_selection;
-  struct wl_list keyboards;
-
-  struct wlr_output_layout *output_layout;
-  struct wl_list outputs;
-  struct wl_listener new_output;
-};
-
-struct dgde_output {
-  struct wl_list link;
-  struct dgde_server *server;
-  struct wlr_output *wlr_output;
-  struct wl_listener frame;
-  struct wl_listener mode;
-
-  struct dgde_workspace *workspaces[16];
-  uint32_t num_workspaces;
-  uint32_t active_workspace;
-};
-
-static void setup_workspaces(struct dgde_server *server,
-                             struct dgde_output *output,
+static void setup_workspaces(struct server *server, struct output *output,
                              uint32_t num_workspaces,
                              const char *name_pattern) {
   output->num_workspaces = num_workspaces > 16 ? 16 : num_workspaces;
@@ -66,15 +33,14 @@ static void setup_workspaces(struct dgde_server *server,
     wlr_log(WLR_DEBUG,
             "creating workspace \"%s\" on output \"%s\" (%p) with geom %dx%d",
             buf, output->wlr_output->description, output, width, height);
-    output->workspaces[i] =
-        dgde_workspace_create(buf, server->seat, width, height);
+    output->workspaces[i] = workspace_create(buf, server->seat, width, height);
   }
 }
 
-static struct dgde_output *
+static struct output *
 dgde_output_from_wlr_output(const struct wlr_output *output,
                             const struct wl_list outputs) {
-  struct dgde_output *res = NULL;
+  struct output *res = NULL;
   wl_list_for_each(res, &outputs, link) {
     if (res->wlr_output == output) {
       return res;
@@ -84,27 +50,38 @@ dgde_output_from_wlr_output(const struct wlr_output *output,
   return NULL;
 }
 
-static void process_cursor_motion(struct dgde_server *server,
-                                  struct wlr_event_pointer_motion *event) {
-  // only send event to current workspace
-  struct dgde_cursor_position pos = dgde_cursor_position(server->cursor);
+static void cursor_motion(const struct server *server,
+                          const struct wlr_event_pointer_motion *event) {
+  struct cursor_position pos = cursor_position(server->cursor);
 
   struct wlr_output *wlr_output =
       wlr_output_layout_output_at(server->output_layout, pos.x, pos.y);
   if (wlr_output != NULL) {
 
-    struct dgde_output *res =
+    struct output *res =
         dgde_output_from_wlr_output(wlr_output, server->outputs);
     if (res != NULL && res->num_workspaces > 0) {
-      struct dgde_workspace *ws = res->workspaces[res->active_workspace];
-      dgde_workspace_on_cursor_motion(ws, server->cursor, event);
+      struct workspace *ws = res->workspaces[res->active_workspace];
+      workspace_on_cursor_motion(ws, server->cursor, event);
     }
   }
 }
 
-static void process_cursor_motion_absolute(
-    struct dgde_server *server,
-    struct wlr_event_pointer_motion_absolute *event) {
+static void process_cursor_motion(struct wl_listener *listener, void *data) {
+  // only send event to current workspace
+  struct server *server =
+      wl_container_of(listener, server, cursor_events.motion);
+  struct wlr_event_pointer_motion *event = data;
+
+  cursor_motion(server, event);
+}
+
+static void process_cursor_motion_absolute(struct wl_listener *listener,
+                                           void *data) {
+
+  struct server *server =
+      wl_container_of(listener, server, cursor_events.motion_absolute);
+  struct wlr_event_pointer_motion_absolute *event = data;
 
   // create a fake relative motion
   struct wlr_event_pointer_motion ev = {
@@ -113,31 +90,39 @@ static void process_cursor_motion_absolute(
       .time_msec = event->time_msec,
       .device = event->device,
   };
-  process_cursor_motion(server, &ev);
+  cursor_motion(server, &ev);
 }
 
-static void process_cursor_button(struct dgde_server *server,
-                                  struct wlr_event_pointer_button *event) {
+static void process_cursor_button(struct wl_listener *listener, void *data) {
+
+  struct server *server =
+      wl_container_of(listener, server, cursor_events.button);
+  struct wlr_event_pointer_button *event = data;
 
   /* Notify the client with pointer focus that a button press has occurred */
   wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button,
                                  event->state);
 }
 
-static void process_cursor_axis(struct dgde_server *server,
-                                struct wlr_event_pointer_axis *event) {
+static void process_cursor_axis(struct wl_listener *listener, void *data) {
+
+  struct server *server = wl_container_of(listener, server, cursor_events.axis);
+  struct wlr_event_pointer_axis *event = data;
+
   /* Notify the client with pointer focus of the axis event. */
   wlr_seat_pointer_notify_axis(server->seat, event->time_msec,
                                event->orientation, event->delta,
                                event->delta_discrete, event->source);
 }
 
-static void process_cursor_frame(struct dgde_server *server) {
+static void process_cursor_frame(struct wl_listener *listener, void *data) {
+  struct server *server =
+      wl_container_of(listener, server, cursor_events.frame);
   /* Notify the client with pointer focus of the frame event. */
   wlr_seat_pointer_notify_frame(server->seat);
 }
 
-static bool handle_keybinding(struct dgde_server *server, xkb_keysym_t sym) {
+static bool handle_keybinding(struct server *server, xkb_keysym_t sym) {
   /*
    * Here we handle compositor keybindings. This is when the compositor is
    * processing keys, rather than passing them on to the client for its own
@@ -173,7 +158,7 @@ static bool handle_keybinding(struct dgde_server *server, xkb_keysym_t sym) {
 static void output_frame(struct wl_listener *listener, void *data) {
   /* This function is called every time an output is ready to display a frame,
    * generally at the output's refresh rate (e.g. 60Hz). */
-  struct dgde_output *output = wl_container_of(listener, output, frame);
+  struct output *output = wl_container_of(listener, output, frame);
   struct wlr_renderer *renderer = output->server->renderer;
 
   struct timespec now;
@@ -192,9 +177,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
   float color[4] = {0.3, 0.3, 0.3, 1.0};
   wlr_renderer_clear(renderer, color);
 
-  struct dgde_workspace *ws = output->workspaces[output->active_workspace];
-  dgde_workspace_render(ws, output->server->renderer, output->wlr_output,
-                        output->server->output_layout, now);
+  struct workspace *ws = output->workspaces[output->active_workspace];
+  workspace_render(ws, output->server->renderer, output->wlr_output,
+                   output->server->output_layout, now);
 
   /* Hardware cursors are rendered by the GPU on a separate plane, and can
    * be moved around without re-rendering what's beneath them - which is
@@ -212,7 +197,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
 }
 
 static void output_mode(struct wl_listener *listener, void *data) {
-  struct dgde_output *output = wl_container_of(listener, output, mode);
+  struct output *output = wl_container_of(listener, output, mode);
   struct wlr_output *wlr_output = data;
 
   int width, height;
@@ -222,20 +207,20 @@ static void output_mode(struct wl_listener *listener, void *data) {
           width, height);
 
   for (uint32_t i = 0, e = output->num_workspaces; i < e; ++i) {
-    dgde_workspace_resize(output->workspaces[i], width, height);
+    workspace_resize(output->workspaces[i], width, height);
   }
 }
 
 static void new_output(struct wl_listener *listener, void *data) {
   /* This event is rasied by the backend when a new output (aka a display or
    * monitor) becomes available. */
-  struct dgde_server *server = wl_container_of(listener, server, new_output);
+  struct server *server = wl_container_of(listener, server, new_output);
   struct wlr_output *wlr_output = data;
 
   wlr_log(WLR_DEBUG, "new output: %s", wlr_output->description);
 
   /* Allocates and configures our state for this output */
-  struct dgde_output *output = calloc(1, sizeof(struct dgde_output));
+  struct output *output = calloc(1, sizeof(struct output));
   output->wlr_output = wlr_output;
   output->server = server;
 
@@ -278,26 +263,25 @@ static void new_output(struct wl_listener *listener, void *data) {
 static void new_xdg_surface(struct wl_listener *listener, void *data) {
   /* This event is raised when wlr_xdg_shell receives a new xdg surface from a
    * client, either a toplevel (application window) or popup. */
-  struct dgde_server *server =
-      wl_container_of(listener, server, new_xdg_surface);
+  struct server *server = wl_container_of(listener, server, new_xdg_surface);
   struct wlr_xdg_surface *xdg_surface = data;
   if (xdg_surface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
     return;
   }
 
-  struct dgde_output *o = wl_container_of(server->outputs.next, o, link);
+  struct output *o = wl_container_of(server->outputs.next, o, link);
 
-  struct dgde_workspace *workspace = o->workspaces[o->active_workspace];
+  struct workspace *workspace = o->workspaces[o->active_workspace];
   wlr_log(WLR_DEBUG, "inserting view into workspace %d on output %s (%p)",
           o->active_workspace, o->wlr_output->description, o);
 
-  dgde_workspace_add_view(workspace, xdg_surface);
+  workspace_add_view(workspace, xdg_surface);
 }
 
 static void new_input(struct wl_listener *listener, void *data) {
   /* This event is raised by the backend when a new input device becomes
    * available. */
-  struct dgde_server *server = wl_container_of(listener, server, new_input);
+  struct server *server = wl_container_of(listener, server, new_input);
   struct wlr_input_device *device = data;
   switch (device->type) {
   case WLR_INPUT_DEVICE_KEYBOARD: {
@@ -309,7 +293,7 @@ static void new_input(struct wl_listener *listener, void *data) {
     break;
   }
   case WLR_INPUT_DEVICE_POINTER:
-    dgde_cursor_new_pointer(server->cursor, device);
+    cursor_new_pointer(server->cursor, device);
     break;
   default:
     break;
@@ -330,15 +314,15 @@ static void seat_request_set_selection(struct wl_listener *listener,
    * usually when the user copies something. wlroots allows compositors to
    * ignore such requests if they so choose, but in tinywl we always honor
    */
-  struct dgde_server *server =
+  struct server *server =
       wl_container_of(listener, server, request_set_selection);
   struct wlr_seat_request_set_selection_event *event = data;
   wlr_seat_set_selection(server->seat, event->source, event->serial);
 }
 
-struct dgde_server *dgde_server_create(const char *seat_name) {
+struct server *server_create(const char *seat_name) {
 
-  struct dgde_server *server = calloc(1, sizeof(struct dgde_server));
+  struct server *server = calloc(1, sizeof(struct server));
   /* The Wayland display is managed by libwayland. It handles accepting
    * clients from the Unix socket, manging Wayland globals, and so on. */
   server->wl_display = wl_display_create();
@@ -394,29 +378,35 @@ struct dgde_server *dgde_server_create(const char *seat_name) {
                 &server->new_xdg_surface);
 
   // create a cursor
-  struct dgde_cursor *cursor =
-      dgde_cursor_create(server->output_layout, server->seat);
-  struct dgde_cursor_handler cursor_handler = {
-      .button = (dgde_cursor_button_cb)process_cursor_button,
-      .motion = (dgde_cursor_motion_cb)process_cursor_motion,
-      .motion_absolute =
-          (dgde_cursor_motion_absolute_cb)process_cursor_motion_absolute,
-      .axis = (dgde_cursor_axis_cb)process_cursor_axis,
-      .frame = (dgde_cursor_frame_cb)process_cursor_frame,
-      .userdata = server};
-  dgde_cursor_add_handler(cursor, &cursor_handler);
+  struct cursor *cursor = cursor_create(server->output_layout, server->seat);
+
+  server->cursor_events.motion.notify = process_cursor_motion;
+  wl_signal_add(&cursor->events.motion, &server->cursor_events.motion);
+
+  server->cursor_events.motion_absolute.notify = process_cursor_motion_absolute;
+  wl_signal_add(&cursor->events.motion_absolute,
+                &server->cursor_events.motion_absolute);
+
+  server->cursor_events.button.notify = process_cursor_button;
+  wl_signal_add(&cursor->events.button, &server->cursor_events.button);
+
+  server->cursor_events.axis.notify = process_cursor_axis;
+  wl_signal_add(&cursor->events.axis, &server->cursor_events.axis);
+
+  server->cursor_events.frame.notify = process_cursor_frame;
+  wl_signal_add(&cursor->events.frame, &server->cursor_events.frame);
 
   server->cursor = cursor;
   return server;
 }
 
-const char *dgde_server_attach_socket(struct dgde_server *server) {
+const char *server_attach_socket(struct server *server) {
 
   /* Add a Unix socket to the Wayland display. */
   return wl_display_add_socket_auto(server->wl_display);
 }
 
-void dgde_server_run(struct dgde_server *server) {
+void server_run(struct server *server) {
 
   /* Start the backend. This will enumerate outputs and inputs, become the DRM
    * master, etc */
@@ -430,7 +420,7 @@ void dgde_server_run(struct dgde_server *server) {
   wl_display_run(server->wl_display);
 }
 
-void dgde_server_destroy(struct dgde_server *server) {
+void server_destroy(struct server *server) {
   wl_display_destroy_clients(server->wl_display);
   wl_display_destroy(server->wl_display);
 

@@ -30,10 +30,12 @@ executable(
     'src/view.c',
     'src/server.c',
     'src/keyboard.c',
-    'src/workspace.c',
+    'src/workspace/workspace.c',
+    'src/workspace/view_tree.c',
     'src/decorations.c',
     xdg_shell_header,
   ],
+  include_directories: include_directories('src'),
   dependencies: [wlroots, wayland, libudev, pixman, xkbcommon],
   c_args: '-DWLR_USE_UNSTABLE',
   install: true
